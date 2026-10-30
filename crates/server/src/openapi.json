@@ -1,0 +1,86 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "aibridge-core",
+    "version": "0.0.0",
+    "description": "Stateless LLM provider gateway. Wire-compatible with aibridge-exec. The provider key goes in the X-Provider-Key header; the service token, when configured, goes in Authorization: Bearer."
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceToken": {"type": "http", "scheme": "bearer"},
+      "providerKey": {"type": "apiKey", "in": "header", "name": "X-Provider-Key"}
+    },
+    "schemas": {
+      "Message": {
+        "type": "object", "required": ["role", "content"],
+        "properties": {"role": {"enum": ["system", "user", "assistant"]}, "content": {"type": "string"}}
+      },
+      "ChatBody": {
+        "type": "object", "required": ["provider", "model", "messages"],
+        "properties": {
+          "provider": {"type": "string", "minLength": 1, "maxLength": 64},
+          "model": {"type": "string", "minLength": 1, "maxLength": 256},
+          "messages": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/Message"}},
+          "system": {"type": ["string", "null"]},
+          "temperature": {"type": ["number", "null"], "minimum": 0, "maximum": 2},
+          "max_tokens": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},
+          "stream": {"type": "boolean", "default": true},
+          "base_url": {"type": ["string", "null"], "maxLength": 2048}
+        }
+      },
+      "ModelsBody": {
+        "type": "object", "required": ["provider"],
+        "properties": {"provider": {"type": "string"}, "base_url": {"type": ["string", "null"]}}
+      },
+      "Usage": {
+        "type": "object",
+        "properties": {"input_tokens": {"type": ["integer", "null"]}, "output_tokens": {"type": ["integer", "null"]}}
+      },
+      "ChatResponse": {
+        "type": "object",
+        "properties": {
+          "text": {"type": "string"}, "model": {"type": "string"},
+          "finish_reason": {"enum": ["stop", "length", "content_filter", "tool_calls", "error", "other", null]},
+          "usage": {"$ref": "#/components/schemas/Usage"}
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {"enum": ["auth", "rate_limited", "bad_request", "not_found", "upstream", "timeout", "network", "unknown_provider", "config"]},
+              "message": {"type": "string"},
+              "provider": {"type": ["string", "null"]},
+              "upstream_status": {"type": ["integer", "null"]}
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [{"serviceToken": []}],
+  "paths": {
+    "/health": {"get": {"security": [], "summary": "Liveness", "responses": {"200": {"description": "ok"}}}},
+    "/v1/providers": {"get": {"summary": "Providers enabled on this server", "responses": {"200": {"description": "{\"providers\": [{id, label, key_url, key_hint}]}"}, "401": {"description": "bad service token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}}}},
+    "/v1/models": {"post": {
+      "summary": "Models the provider key can use",
+      "security": [{"serviceToken": [], "providerKey": []}],
+      "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelsBody"}}}},
+      "responses": {"200": {"description": "{\"models\": [{id, name, context_length}]}"}, "4XX": {"description": "error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}}
+    }},
+    "/v1/chat": {"post": {
+      "summary": "Chat completion; streamed as Server-Sent Events unless stream is false",
+      "description": "Stream events: `delta` {type, text}, then one `done` {type, finish_reason, model, usage}. A provider failure mid-stream sends `error` {type, error}.",
+      "security": [{"serviceToken": [], "providerKey": []}],
+      "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatBody"}}}},
+      "responses": {
+        "200": {"description": "text/event-stream, or a ChatResponse when stream is false", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatResponse"}}, "text/event-stream": {}}},
+        "4XX": {"description": "error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+        "5XX": {"description": "provider failure", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+      }
+    }},
+    "/v1/stats": {"get": {"summary": "Cache counters (aibridge-core only)", "responses": {"200": {"description": "{engine, version, cache: {models, chat} | null}"}}}}
+  }
+}

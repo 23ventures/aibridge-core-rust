@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "aibridge-core"
+version = "0.1.0"
+description = "Rust-backed drop-in for aibridge_exec.providers: chat, streaming and model listing for many LLM providers with your own key."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+
+[tool.maturin]
+manifest-path = "crates/python/Cargo.toml"
+python-source = "python"
+module-name = "aibridge_core._native"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+asyncio_mode = "auto"

@@ -1,0 +1,89 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude aibridge-core-py --locked
+
+  # Same requests through aibridge-exec and aibridge-core (HTTP server and Python library); every
+  # response must match. Also runs a short benchmark for the log (informational, never fails CI).
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/aibridge-exec
+          path: .aibridge-exec
+          token: ${{ secrets.EXEC_REPO_TOKEN || github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p aibridge-core-server --examples --bin aibridge-core
+      - name: Install aibridge-exec and the aibridge-core wheel
+        run: |
+          python -m venv .venv && . .venv/bin/activate
+          pip install "./.aibridge-exec[server]" maturin pytest pytest-asyncio httpx
+          maturin build --release --out dist && pip install dist/*.whl
+      - name: Python library parity
+        run: . .venv/bin/activate && python -m pytest -q
+      - name: HTTP server parity
+        run: . .venv/bin/activate && python tests/parity/run_parity.py
+      - name: Benchmark (informational)
+        continue-on-error: true
+        run: |
+          . .venv/bin/activate
+          python tests/bench/run_bench.py --quick --out bench-server.md
+          python tests/bench/bench_python.py --quick --out bench-python.md
+          cat bench-server.md bench-python.md >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t aibridge-core .
+      - name: Smoke test
+        run: |
+          docker run -d --name core -p 8000:8000 -e AIBRIDGE_EXEC_API_TOKENS=t aibridge-core
+          for i in $(seq 20); do curl -sf localhost:8000/health && break; sleep 1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/v1/providers)" = 401
+
+  # Wheels for the platform (Linux x86_64/arm64, macOS arm64), attached to the run and to tags.
+  wheels:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-latest, target: aarch64, manylinux: "2_28" }
+          - { os: macos-14, target: aarch64, manylinux: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl

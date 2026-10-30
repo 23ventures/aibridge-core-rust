@@ -1,0 +1,28 @@
+[package]
+name = "aibridge-core-server"
+description = "HTTP server for aibridge-core, wire-compatible with the aibridge-exec server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aibridge-core"
+path = "src/main.rs"
+
+[dependencies]
+aibridge-core.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+tokio = { workspace = true, features = ["signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+reqwest.workspace = true
