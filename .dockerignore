@@ -1,5 +1,5 @@
+# Also the build context for aibridge-platform's core-wheels stage, which needs python/ and README.md.
 target
-python
 tests
 bench
 docs
