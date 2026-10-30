@@ -37,7 +37,7 @@ All `AIBRIDGE_EXEC_*` server variables are read unchanged, so the same secrets w
 
 ```yaml
   exec:
-    build: ../aibridge-core          # was ../aibridge-exec
+    build: ../aibridge-core-rust     # was ../aibridge-exec
     environment:
       AIBRIDGE_EXEC_API_TOKENS: ${AIBRIDGE_EXEC_TOKEN:-local-dev-token}
       # optional: cache each key's model list for 5 minutes
@@ -45,7 +45,7 @@ All `AIBRIDGE_EXEC_*` server variables are read unchanged, so the same secrets w
     ports: ["8000:8000"]
 ```
 
-**CI** (`.github/workflows/ci.yml`): check out `aibridge-core` instead of `aibridge-exec`, then
+**CI** (`.github/workflows/ci.yml`): check out `23ventures/aibridge-core-rust` (into `aibridge-core`) instead of `aibridge-exec`, then
 replace the server start line:
 
 ```yaml
@@ -146,7 +146,7 @@ RUN --mount=type=bind,from=core-wheel,source=/core-wheels,target=/core-wheels \
     pip install --no-index --find-links=/core-wheels aibridge-core
 ```
 
-and build with `--build-context aibridge_core=../aibridge-core`, like aibridge-exec.
+and build with `--build-context aibridge_core=../aibridge-core-rust`, like aibridge-exec.
 
 ## Caching (new; off by default)
 

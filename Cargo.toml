@@ -7,7 +7,7 @@ version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 license = "LicenseRef-Proprietary"
-repository = "https://github.com/23ventures/aibridge-core"
+repository = "https://github.com/23ventures/aibridge-core-rust"
 publish = false
 
 [workspace.dependencies]
