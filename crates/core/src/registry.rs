@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use crate::adapter::ProviderAdapter;
 use crate::error::{ErrorCode, ProviderError, Result};
-use crate::providers::{anthropic::AnthropicAdapter, gemini::GeminiAdapter, openai_compat};
+use crate::providers::{
+    anthropic::AnthropicAdapter, cohere::CohereAdapter, dashscope::DashScopeAdapter, gemini::GeminiAdapter,
+    ollama::OllamaAdapter, openai_compat, responses,
+};
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -25,6 +28,10 @@ impl Registry {
         }
         registry.adapters.push(Arc::new(AnthropicAdapter::default()));
         registry.adapters.push(Arc::new(GeminiAdapter::default()));
+        registry.adapters.push(Arc::new(CohereAdapter::default()));
+        registry.adapters.push(Arc::new(DashScopeAdapter::default()));
+        registry.adapters.push(Arc::new(responses::meta()));
+        registry.adapters.push(Arc::new(OllamaAdapter::default()));
         registry.adapters.push(Arc::new(openai_compat::custom()));
         registry
     }
@@ -97,9 +104,19 @@ mod tests {
                 "deepseek",
                 "mistral",
                 "together",
+                "kimi",
+                "nvidia",
+                "zai",
+                "minimax",
+                "arcee",
+                "ai21",
                 "anthropic",
                 "gemini",
-                "openai_compatible"
+                "cohere",
+                "alibaba",
+                "meta",
+                "ollama",
+                "openai_compatible",
             ]
         );
         let error = registry.get("nope").err().unwrap();

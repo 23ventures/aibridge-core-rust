@@ -22,15 +22,18 @@ Differences from aibridge-exec:
 """
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from . import _native
 from .errors import ProviderError
-from .types import ChatMessage, ChatRequest, ChatResponse, ModelInfo, ProviderInfo, StreamEvent, Usage
+from .types import (REASONING_EFFORTS, ChatMessage, ChatRequest, ChatResponse, ModelInfo, ProviderInfo, ResponseFormat,
+                    StreamEvent, Usage)
 
 Messages = Iterable["ChatMessage | Mapping[str, Any]"]
+Format = "ResponseFormat | Mapping[str, Any] | None"
 
 #: (connect, read) seconds, the same defaults as aibridge-exec.
 DEFAULT_TIMEOUT = (10.0, 300.0)
@@ -54,9 +57,13 @@ class CacheOptions:
 
 @dataclass(frozen=True)
 class ProviderHandle:
-    """What ``get_provider`` returns: the id and the provider's ``ProviderInfo``."""
+    """What ``get_provider`` returns: the provider's ``ProviderInfo`` and the adapter capabilities
+    aibridge-exec adapters expose (``requires_key``, ``stream_format``, ``needs_custom_base_url``)."""
 
     info: ProviderInfo
+    requires_key: bool = True
+    needs_custom_base_url: bool = False
+    stream_format: str = "sse"
 
     @property
     def id(self) -> str:
@@ -65,9 +72,10 @@ class ProviderHandle:
 
 def _load_providers() -> dict[str, ProviderHandle]:
     out = {}
-    for id_, label, key_url, base_url, hint in _native.providers():
-        out[id_] = ProviderHandle(ProviderInfo(id=id_, label=label, key_url=key_url, default_base_url=base_url,
-                                               key_hint=hint))
+    for id_, label, key_url, base_url, hint, requires_key, needs_url, stream_format in _native.providers():
+        info = ProviderInfo(id=id_, label=label, key_url=key_url, default_base_url=base_url, key_hint=hint)
+        out[id_] = ProviderHandle(info, requires_key=requires_key, needs_custom_base_url=needs_url,
+                                  stream_format=stream_format)
     return out
 
 
@@ -94,39 +102,57 @@ def register_provider(adapter: object, *, replace: bool = False) -> None:
 
 # ---------------------------------------------------------------- shared helpers
 def _request(model: str, messages: Messages, system: str | None, temperature: float | None,
-             max_tokens: int | None) -> ChatRequest:
+             max_tokens: int | None, response_format: Format = None, reasoning_effort: str | None = None,
+             thinking: bool | None = None) -> ChatRequest:
     try:
-        return ChatRequest.build(model, messages, system=system, temperature=temperature, max_tokens=max_tokens)
+        return ChatRequest.build(model, messages, system=system, temperature=temperature, max_tokens=max_tokens,
+                                 response_format=response_format, reasoning_effort=reasoning_effort,
+                                 thinking=thinking)
     except (ValueError, TypeError, KeyError) as exc:
         raise ProviderError("bad_request", f"invalid request: {exc}") from None
 
 
-def _require_key(provider_id: str, api_key: str | None) -> str:
+def _require_key(handle: ProviderHandle, api_key: str | None) -> str:
     if not api_key or not api_key.strip():
-        raise ProviderError("auth", "an API key is required", provider=provider_id)
+        if not handle.requires_key:
+            return ""  # a local server (Ollama) needs none; a key is sent only when given
+        raise ProviderError("auth", "an API key is required", provider=handle.id)
     return api_key.strip()
 
 
-def _native_args(request: ChatRequest) -> dict[str, Any]:
-    return {
-        "model": request.model,
-        "messages": [(m.role, m.content) for m in request.messages],
-        "system": request.system,
-        "temperature": None if request.temperature is None else float(request.temperature),
-        "max_tokens": request.max_tokens,
-    }
+def _native_request(request: ChatRequest) -> tuple:
+    fmt = request.response_format
+    native_format = None
+    if fmt is not None:
+        schema = None if fmt.schema is None else json.dumps(dict(fmt.schema))
+        native_format = (schema, fmt.name, fmt.description)
+    return (
+        request.model,
+        [(m.role, m.content, bool(m.cache)) for m in request.messages],
+        request.system,
+        None if request.temperature is None else float(request.temperature),
+        request.max_tokens,
+        native_format,
+        request.reasoning_effort,
+        None if request.thinking is None else bool(request.thinking),
+    )
+
+
+def _usage(raw: tuple) -> Usage:
+    input_tokens, output_tokens, cache_read, cache_write = raw
+    return Usage(input_tokens, output_tokens, cache_read_tokens=cache_read, cache_write_tokens=cache_write)
 
 
 def _reply(raw: tuple) -> ChatResponse:
-    text, model, finish, input_tokens, output_tokens = raw
-    return ChatResponse(text=text, model=model, finish_reason=finish, usage=Usage(input_tokens, output_tokens))
+    text, model, finish, usage = raw
+    return ChatResponse(text=text, model=model, finish_reason=finish, usage=_usage(usage))
 
 
 def _event(raw: tuple) -> StreamEvent:
-    kind, first, model, input_tokens, output_tokens = raw
+    kind, first, model, usage = raw
     if kind == "delta":
         return StreamEvent("delta", text=first)
-    return StreamEvent("done", finish_reason=first, usage=Usage(input_tokens, output_tokens), model=model)
+    return StreamEvent("done", finish_reason=first, usage=_usage(usage), model=model)
 
 
 def _models(raw: list[tuple]) -> list[ModelInfo]:
@@ -185,20 +211,22 @@ class ChatClient(_Base):
 
     def chat(self, provider: str, *, api_key: str, model: str, messages: Messages, system: str | None = None,
              temperature: float | None = None, max_tokens: int | None = None,
-             base_url: str | None = None) -> ChatResponse:
-        get_provider(provider)
-        key = _require_key(provider, api_key)
-        request = _request(model, messages, system, temperature, max_tokens)
-        return _reply(self._native.chat(provider, key, base_url=base_url, **_native_args(request)))
+             base_url: str | None = None, response_format: Format = None, reasoning_effort: str | None = None,
+             thinking: bool | None = None) -> ChatResponse:
+        key = _require_key(get_provider(provider), api_key)
+        request = _request(model, messages, system, temperature, max_tokens, response_format, reasoning_effort,
+                           thinking)
+        return _reply(self._native.chat(provider, key, _native_request(request), base_url=base_url))
 
     def stream(self, provider: str, *, api_key: str, model: str, messages: Messages, system: str | None = None,
                temperature: float | None = None, max_tokens: int | None = None,
-               base_url: str | None = None) -> Iterator[StreamEvent]:
+               base_url: str | None = None, response_format: Format = None, reasoning_effort: str | None = None,
+               thinking: bool | None = None) -> Iterator[StreamEvent]:
         # A generator, like aibridge-exec: nothing runs (or raises) until the first next().
-        get_provider(provider)
-        key = _require_key(provider, api_key)
-        request = _request(model, messages, system, temperature, max_tokens)
-        native = self._native.stream(provider, key, base_url=base_url, **_native_args(request))
+        key = _require_key(get_provider(provider), api_key)
+        request = _request(model, messages, system, temperature, max_tokens, response_format, reasoning_effort,
+                           thinking)
+        native = self._native.stream(provider, key, _native_request(request), base_url=base_url)
         try:
             for batch in native:  # the engine hands over every event already decoded at once
                 for raw in batch:
@@ -207,8 +235,7 @@ class ChatClient(_Base):
             native.close()
 
     def list_models(self, provider: str, *, api_key: str, base_url: str | None = None) -> list[ModelInfo]:
-        get_provider(provider)
-        key = _require_key(provider, api_key)
+        key = _require_key(get_provider(provider), api_key)
         return _models(self._native.list_models(provider, key, base_url=base_url))
 
 
@@ -226,19 +253,21 @@ class AsyncChatClient(_Base):
 
     async def chat(self, provider: str, *, api_key: str, model: str, messages: Messages, system: str | None = None,
                    temperature: float | None = None, max_tokens: int | None = None,
-                   base_url: str | None = None) -> ChatResponse:
-        get_provider(provider)
-        key = _require_key(provider, api_key)
-        request = _request(model, messages, system, temperature, max_tokens)
-        return _reply(await self._native.achat(provider, key, base_url=base_url, **_native_args(request)))
+                   base_url: str | None = None, response_format: Format = None,
+                   reasoning_effort: str | None = None, thinking: bool | None = None) -> ChatResponse:
+        key = _require_key(get_provider(provider), api_key)
+        request = _request(model, messages, system, temperature, max_tokens, response_format, reasoning_effort,
+                           thinking)
+        return _reply(await self._native.achat(provider, key, _native_request(request), base_url=base_url))
 
     async def stream(self, provider: str, *, api_key: str, model: str, messages: Messages,
                      system: str | None = None, temperature: float | None = None, max_tokens: int | None = None,
-                     base_url: str | None = None) -> AsyncIterator[StreamEvent]:
-        get_provider(provider)
-        key = _require_key(provider, api_key)
-        request = _request(model, messages, system, temperature, max_tokens)
-        native = self._native.astream(provider, key, base_url=base_url, **_native_args(request))
+                     base_url: str | None = None, response_format: Format = None,
+                     reasoning_effort: str | None = None, thinking: bool | None = None) -> AsyncIterator[StreamEvent]:
+        key = _require_key(get_provider(provider), api_key)
+        request = _request(model, messages, system, temperature, max_tokens, response_format, reasoning_effort,
+                           thinking)
+        native = self._native.astream(provider, key, _native_request(request), base_url=base_url)
         try:
             async for batch in native:
                 for raw in batch:
@@ -247,14 +276,11 @@ class AsyncChatClient(_Base):
             await native.aclose()
 
     async def list_models(self, provider: str, *, api_key: str, base_url: str | None = None) -> list[ModelInfo]:
-        get_provider(provider)
-        key = _require_key(provider, api_key)
+        key = _require_key(get_provider(provider), api_key)
         return _models(await self._native.alist_models(provider, key, base_url=base_url))
 
 
 def stream_event_json(event: StreamEvent) -> str:
-    import json
-
     return json.dumps(event.to_dict(), separators=(",", ":"))
 
 
@@ -269,6 +295,8 @@ __all__ = [
     "ProviderError",
     "ProviderHandle",
     "ProviderInfo",
+    "REASONING_EFFORTS",
+    "ResponseFormat",
     "StreamEvent",
     "Usage",
     "get_provider",

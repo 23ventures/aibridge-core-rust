@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 [dependencies]
 aibridge-core.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
 pyo3 = { version = "0.30", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 tokio.workspace = true

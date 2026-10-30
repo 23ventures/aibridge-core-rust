@@ -15,7 +15,8 @@ pub struct ServerSettings {
     pub api_tokens: Vec<String>,
     /// Browser origins allowed to call the server directly (CORS). Empty = none.
     pub cors_origins: Vec<String>,
-    /// Provider ids to expose. Empty = every registered provider except `openai_compatible`.
+    /// Provider ids to expose. Empty = every registered provider except `openai_compatible` and `ollama`
+    /// (unless custom base URLs are allowed or a base URL is configured for them).
     pub providers: Vec<String>,
     /// Let callers send their own `base_url` (enables `openai_compatible`). Off by default: it lets
     /// callers make the server send requests to any URL, including your internal network.
@@ -127,7 +128,9 @@ impl ServerSettings {
         if !self.providers.is_empty() {
             return self.providers.iter().any(|p| p == provider_id);
         }
-        provider_id != "openai_compatible" || self.allow_custom_base_url
+        !matches!(provider_id, "openai_compatible" | "ollama")
+            || self.allow_custom_base_url
+            || self.base_urls.contains_key(provider_id)
     }
 }
 

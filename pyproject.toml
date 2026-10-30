@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "aibridge-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust-backed drop-in for aibridge_exec.providers: chat, streaming and model listing for many LLM providers with your own key."
 readme = "README.md"
 requires-python = ">=3.11"

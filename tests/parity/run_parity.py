@@ -93,6 +93,17 @@ SCENARIOS: list[tuple[str, str, str, dict, object]] = [
     ("chat: max_tokens fraction", "POST", "/v1/chat", KEYED, {**chat("openai"), "max_tokens": 1.5}),
     ("chat: invalid json body", "POST", "/v1/chat", KEYED, b"{not json"),
     ("chat: body is a list", "POST", "/v1/chat", KEYED, []),
+    *[
+        (f"chat: {provider} {'stream' if stream else 'non-stream'} (recorded request)", "POST", "/v1/chat", KEYED,
+         {**chat(provider, stream=stream, model=model), "system": "Be brief", "temperature": 0.4, "max_tokens": 64,
+          "messages": [*msgs("Héllo 😀"), {"role": "assistant", "content": "ok"}, *msgs("again")]})
+        for provider, model in (("cohere", "command-a"), ("alibaba", "qwen-plus"), ("meta", "muse"),
+                                ("ollama", "llama3"), ("kimi", "kimi-k2.5"), ("nvidia", "thinker"),
+                                ("zai", "glm-4.6"), ("minimax", "thinker"), ("ai21", "jamba"))
+        for stream in (True, False)
+    ],
+    *[(f"models: {provider} (recorded request)", "POST", "/v1/models", KEYED, {"provider": provider})
+      for provider in ("cohere", "alibaba", "meta", "ollama", "kimi")],
     ("unknown route", "GET", "/nope", {}, None),
     ("wrong method", "DELETE", "/v1/chat", {}, None),
 ]
@@ -229,6 +240,10 @@ def main() -> int:
            "AIBRIDGE_EXEC_BASE_URL_ANTHROPIC": f"{mock_url}/v1",
            "AIBRIDGE_EXEC_BASE_URL_GEMINI": f"{mock_url}/v1beta",
            "AIBRIDGE_EXEC_BASE_URL_GROQ": "http://127.0.0.1:9/never-called",
+           # recording mode: the reply text is the request the adapter sent
+           **{f"AIBRIDGE_EXEC_BASE_URL_{p.upper()}": f"{mock_url}/rec/{p}"
+              for p in ("cohere", "meta", "ollama", "kimi", "nvidia", "zai", "minimax", "ai21")},
+           "AIBRIDGE_EXEC_BASE_URL_ALIBABA": f"{mock_url}/rec/alibaba/api/v1",
            "AIBRIDGE_EXEC_MAX_MESSAGES": "50",
            "AIBRIDGE_EXEC_MAX_MESSAGE_CHARS": "2000",
            "AIBRIDGE_EXEC_MAX_TOTAL_CHARS": "4000",

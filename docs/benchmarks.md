@@ -3,6 +3,10 @@
 Measured 2026-10-30 on a 2-core x86_64 Linux VM, aibridge-exec `25b80c8` (FastAPI + uvicorn[standard]
 + httpx, Python 3.13) against aibridge-core 0.1.0 (axum + reqwest, release build).
 
+Re-checked after the 0.2.0 port (aibridge-exec 0.4.0 `8a5d31a`, `run_bench.py --quick`): chat 267 vs
+9,318 req/s (35×), streamed chat 86 vs 1,099 req/s (13×), 500 slow streams p99 4.1 s vs 0.58 s,
+peak memory 65 vs 11 MB. Same picture as below: the extra provider rules cost nothing measurable.
+
 Both run the same workloads against the same fake provider. The numbers are the cost of the
 gateway itself, not of a real provider. Re-run them with:
 

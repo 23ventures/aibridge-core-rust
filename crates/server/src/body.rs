@@ -195,7 +195,7 @@ impl<'a> Checker<'a> {
                 }
             };
             if let (Some(role), Some(content)) = (role, content) {
-                out.push(ChatMessage { role, content });
+                out.push(ChatMessage::new(role, content));
             }
         }
         out

@@ -142,10 +142,13 @@ fn authorize(settings: &ServerSettings, headers: &HeaderMap) -> Result<(), Provi
 
 fn enabled(state: &AppState, provider_id: &str) -> bool {
     let settings = &state.settings;
-    settings.provider_enabled(provider_id)
-        && (provider_id != "openai_compatible"
-            || settings.allow_custom_base_url
-            || settings.base_urls.contains_key(provider_id))
+    if !settings.provider_enabled(provider_id) {
+        return false;
+    }
+    // Unknown ids are reported by resolve().
+    let Ok(adapter) = state.client.registry().get(provider_id) else { return true };
+    // openai_compatible and ollama have no public endpoint: only with a URL to call.
+    !adapter.needs_custom_base_url() || settings.allow_custom_base_url || settings.base_urls.contains_key(provider_id)
 }
 
 fn resolve(state: &AppState, provider_id: &str, base_url: Option<&str>) -> Result<(), ProviderError> {
@@ -244,13 +247,10 @@ async fn chat(State(state): State<SharedState>, headers: HeaderMap, raw: Bytes) 
     resolve(&state, &body.provider, body.base_url.as_deref())?;
     check_size(&state.settings, &body)?;
     let key = provider_key(&headers);
-    let request = ChatRequest {
-        model: body.model,
-        messages: body.messages,
-        system: body.system,
-        temperature: body.temperature,
-        max_tokens: body.max_tokens,
-    };
+    let mut request = ChatRequest::new(body.model, body.messages);
+    request.system = body.system;
+    request.temperature = body.temperature;
+    request.max_tokens = body.max_tokens;
     let base_url = body.base_url.as_deref();
 
     if !body.stream {

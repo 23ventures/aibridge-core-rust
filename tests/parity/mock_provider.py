@@ -10,11 +10,18 @@ The last user message selects a scenario:
     "server error"  500 with an HTML body          "bad json"     200 with a non-JSON body
     "unicode"       reply with accents and emoji   "echo key"     error message containing the key
 Model "missing-model" answers 404.
+
+Recording mode: any path under ``/rec/<provider>/...`` answers in that path's protocol (OpenAI,
+Anthropic, Gemini, Cohere, DashScope, Responses, Ollama) with a reply whose text is the exact
+request it received (path, query, relevant headers, body), so comparing replies compares requests.
+When the request asks for structured output the echo comes back the way that provider returns
+it (a tool call, a function call), and replies carry cache usage, so parsing is exercised too.
+Model "thinker" puts a ``<think>`` block before the text.
 """
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 GOOD_KEY = "sk-test-good-key-1234"
 OPENAI_MODELS = ["mock-small", "mock-large", "text-embedding-mock", "whisper-mock"]
@@ -80,6 +87,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------------- routing
     def do_GET(self):
+        if self.path.startswith("/rec/"):
+            return self._record("GET", None)
         if self._key() != GOOD_KEY:
             return self._unauthorized()
         url = urlparse(self.path)
@@ -103,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path.startswith("/rec/"):
+            return self._record("POST", body)
         if self._key() != GOOD_KEY:
             return self._unauthorized()
         url = urlparse(self.path)
@@ -195,6 +206,171 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps({"candidates": [{"content": {"parts": [{"text": word}]}}]}))
         self._send(json.dumps({"modelVersion": model + "-001", "usageMetadata": usage,
                                "candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}))
+
+    # ---------------------------------------------------------------- recording mode
+    ECHO_HEADERS = ("authorization", "x-api-key", "anthropic-version", "x-goog-api-key", "content-type", "accept",
+                    "x-dashscope-sse")
+
+    def _record(self, method, body):
+        url = urlparse(self.path)
+        _, _, provider, rest = url.path.split("/", 3)
+        path = "/" + rest
+        # the key is shown as a marker, so echoed requests never carry it into responses
+        headers = {name: self.headers.get(name).replace(GOOD_KEY, "<good-key>") for name in self.ECHO_HEADERS
+                   if self.headers.get(name) is not None}
+        echo = json.dumps({"method": method, "path": path, "query": sorted(parse_qsl(url.query)),
+                           "headers": headers, "body": body}, ensure_ascii=False)
+        if method == "GET":
+            return self._json(200, self._models_reply(path, echo))
+        model = (body or {}).get("model") or path.split("/models/")[-1].split(":")[0]
+        text = ("<think>hidden plan</think>" + echo) if model == "thinker" else echo
+        stream = bool(body.get("stream")) or path.endswith(":streamGenerateContent")
+        if path.endswith("/chat/completions"):
+            return self._rec_openai(body, text, stream)
+        if path.endswith("/messages"):
+            return self._rec_anthropic(body, text, stream)
+        if ":" in path and "/models/" in path:
+            return self._rec_gemini(text, stream)
+        if path.endswith("/v2/chat"):
+            return self._rec_cohere(text, stream)
+        if path.endswith("/text-generation/generation"):
+            return self._rec_dashscope(body, text, stream)
+        if path.endswith("/responses"):
+            return self._rec_responses(body, text, stream)
+        if path.endswith("/api/chat"):
+            return self._rec_ollama(text, stream)
+        self._json(404, {"error": {"message": f"no protocol for {path}"}})
+
+    @staticmethod
+    def _models_reply(path, echo):
+        if path.endswith("/api/tags"):
+            return {"models": [{"name": "b:latest", "model": "b:latest"}, {"name": echo}]}
+        # one body that every list protocol can read: "data" (OpenAI, Anthropic, Responses) and
+        # "models" (Gemini, Cohere)
+        return {"data": [{"id": echo, "display_name": "Echo", "context_length": 4096}], "has_more": False,
+                "models": [{"name": "models/" + echo, "supportedGenerationMethods": ["generateContent"],
+                            "inputTokenLimit": 10, "context_length": 4096}]}
+
+    @staticmethod
+    def _chunks(text, size=37):
+        return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+    def _rec_openai(self, body, text, stream):
+        tool = bool(body.get("tools"))
+        usage = {"prompt_tokens": 40, "completion_tokens": 9, "prompt_tokens_details": {"cached_tokens": 32}}
+        if not stream:
+            message = {"role": "assistant", "content": None if tool else text}
+            if tool:
+                message["tool_calls"] = [{"id": "c1", "type": "function",
+                                          "function": {"name": "f", "arguments": text}}]
+            return self._json(200, {"model": body["model"] + "-v", "usage": usage, "choices": [
+                {"index": 0, "message": message, "finish_reason": "tool_calls" if tool else "stop"}]})
+        self._start_stream()
+        for chunk in self._chunks(text):
+            delta = ({"tool_calls": [{"index": 0, "function": {"arguments": chunk}}]} if tool
+                     else {"content": chunk})
+            self._send(json.dumps({"model": body["model"] + "-v", "choices": [{"index": 0, "delta": delta}]}))
+        self._send(json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool else "stop"}]}))
+        self._send(json.dumps({"choices": [], "usage": usage}))
+        self._send("[DONE]")
+
+    def _rec_anthropic(self, body, text, stream):
+        tool = bool(body.get("tools"))
+        usage = {"input_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 300,
+                 "output_tokens": 1}
+        if not stream:
+            content = ([{"type": "text", "text": ""}, {"type": "tool_use", "id": "t", "name": "x",
+                                                       "input": {"echo": text, "ünï": [1, 2.5, None]}}]
+                       if tool else [{"type": "thinking", "thinking": "x"}, {"type": "text", "text": text}])
+            return self._json(200, {"type": "message", "model": body["model"], "content": content,
+                                    "stop_reason": "tool_use" if tool else "end_turn",
+                                    "usage": {**usage, "output_tokens": 12}})
+        self._start_stream()
+        self._send(json.dumps({"type": "message_start", "message": {"model": body["model"], "usage": usage}}),
+                   "message_start")
+        for chunk in self._chunks(text):
+            delta = ({"type": "input_json_delta", "partial_json": chunk} if tool
+                     else {"type": "text_delta", "text": chunk})
+            self._send(json.dumps({"type": "content_block_delta", "index": 0, "delta": delta}), "content_block_delta")
+        self._send(json.dumps({"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
+                               "usage": {"output_tokens": 21}}), "message_delta")
+        self._send(json.dumps({"type": "message_stop"}), "message_stop")
+
+    def _rec_gemini(self, text, stream):
+        usage = {"promptTokenCount": 9, "candidatesTokenCount": 4, "thoughtsTokenCount": 2}
+        if not stream:
+            return self._json(200, {"modelVersion": "g-001", "usageMetadata": usage, "candidates": [
+                {"content": {"parts": [{"text": "plan", "thought": True}, {"text": text}]}, "finishReason": "STOP"}]})
+        self._start_stream()
+        for chunk in self._chunks(text):
+            self._send(json.dumps({"candidates": [{"content": {"parts": [{"text": chunk}]}}]}))
+        self._send(json.dumps({"modelVersion": "g-001", "usageMetadata": usage,
+                               "candidates": [{"content": {"parts": []}, "finishReason": "MAX_TOKENS"}]}))
+
+    def _rec_cohere(self, text, stream):
+        if not stream:
+            return self._json(200, {"id": "r", "finish_reason": "COMPLETE", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "x"}, {"type": "text", "text": text}]},
+                "usage": {"billed_units": {"input_tokens": 3, "output_tokens": 4}, "tokens": {"input_tokens": 30,
+                                                                                            "output_tokens": 40}}})
+        self._start_stream()
+        self._send(json.dumps({"type": "message-start", "id": "r"}), "message-start")
+        for chunk in self._chunks(text):
+            self._send(json.dumps({"type": "content-delta", "index": 0,
+                                   "delta": {"message": {"content": {"text": chunk}}}}), "content-delta")
+        self._send(json.dumps({"type": "message-end", "delta": {"finish_reason": "MAX_TOKENS",
+                                                                "usage": {"tokens": {"input_tokens": 7,
+                                                                                     "output_tokens": 8}}}}),
+                   "message-end")
+
+    def _rec_dashscope(self, body, text, stream):
+        tool = (body.get("parameters") or {}).get("response_format") is not None and body["model"] == "qwen-tool"
+        def choice(chunk, finish):
+            message = {"role": "assistant", "content": "" if tool else chunk}
+            if tool:
+                message["tool_calls"] = [{"function": {"name": "f", "arguments": chunk}}]
+            return {"output": {"choices": [{"message": message, "finish_reason": finish}]}}
+        if not stream:
+            return self._json(200, {**choice(text, "stop"), "usage": {"input_tokens": 6, "output_tokens": 7},
+                                    "request_id": "q"})
+        self._start_stream()
+        chunks = self._chunks(text)
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            payload = choice(chunk, "stop" if last else "null")
+            if last:
+                payload["usage"] = {"input_tokens": 6, "output_tokens": 7}
+            self._send(json.dumps(payload), "result")
+
+    def _rec_responses(self, body, text, stream):
+        tool = bool(body.get("tools"))
+        usage = {"input_tokens": 50, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 20}}
+        output = ([{"type": "reasoning", "summary": []},
+                   {"type": "function_call", "name": "f", "call_id": "c", "arguments": text}] if tool
+                  else [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}])
+        response = {"id": "r", "model": body["model"] + "-v", "status": "completed", "output": output, "usage": usage}
+        if not stream:
+            return self._json(200, response)
+        self._start_stream()
+        kind = "response.function_call_arguments.delta" if tool else "response.output_text.delta"
+        for chunk in self._chunks(text):
+            self._send(json.dumps({"type": kind, "delta": chunk}), kind)
+        self._send(json.dumps({"type": "response.completed", "response": response}), "response.completed")
+
+    def _rec_ollama(self, text, stream):
+        final = {"model": "llama-v", "done": True, "done_reason": "stop", "prompt_eval_count": 12, "eval_count": 3}
+        if not stream:
+            return self._json(200, {**final, "message": {"role": "assistant", "content": text}})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        for chunk in self._chunks(text):
+            self.wfile.write((json.dumps({"model": "llama-v", "message": {"content": chunk}, "done": False}) + "\n").encode())
+            self.wfile.flush()
+        self.wfile.write(json.dumps({**final, "message": {"content": ""}}).encode())  # no trailing newline
+        self.wfile.flush()
 
 
 if __name__ == "__main__":

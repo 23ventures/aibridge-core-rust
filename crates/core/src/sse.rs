@@ -1,4 +1,5 @@
-//! Incremental Server-Sent Events decoder: bytes in, `(event, data)` pairs out.
+//! Incremental stream decoders: Server-Sent Events and newline-delimited JSON. Both turn byte
+//! chunks into `(event, data)` pairs, so stream parsers handle either.
 //!
 //! Works on bytes so a multi-byte UTF-8 character split across network chunks is never
 //! mangled: lines are only cut at ASCII `\r` / `\n`, then decoded.
@@ -86,6 +87,69 @@ fn find_newline(bytes: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Newline-delimited JSON (Ollama's native API): each non-empty line is one event.
+#[derive(Debug, Default)]
+pub struct NdjsonDecoder {
+    buffer: Vec<u8>,
+}
+
+impl NdjsonDecoder {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(index) = self.buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=index).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_owned();
+            if !text.is_empty() {
+                events.push((None, text));
+            }
+        }
+        events
+    }
+
+    pub fn flush(&mut self) -> Vec<SseEvent> {
+        let tail = String::from_utf8_lossy(&std::mem::take(&mut self.buffer)).trim().to_owned();
+        if tail.is_empty() {
+            Vec::new()
+        } else {
+            vec![(None, tail)]
+        }
+    }
+}
+
+/// The decoder for a stream: SSE or NDJSON (chosen from the adapter's format and Content-Type).
+#[derive(Debug)]
+pub enum StreamDecoder {
+    Sse(SseDecoder),
+    Ndjson(NdjsonDecoder),
+}
+
+impl StreamDecoder {
+    pub fn for_format(format: crate::adapter::StreamFormat, content_type: Option<&str>) -> Self {
+        use crate::adapter::StreamFormat;
+        let event_stream = content_type.is_some_and(|c| c.to_ascii_lowercase().contains("event-stream"));
+        match format {
+            StreamFormat::Ndjson => Self::Ndjson(NdjsonDecoder::default()),
+            StreamFormat::Auto if !event_stream => Self::Ndjson(NdjsonDecoder::default()),
+            _ => Self::Sse(SseDecoder::new()),
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        match self {
+            Self::Sse(d) => d.feed(chunk),
+            Self::Ndjson(d) => d.feed(chunk),
+        }
+    }
+
+    pub fn flush(&mut self) -> Vec<SseEvent> {
+        match self {
+            Self::Sse(d) => d.flush(),
+            Self::Ndjson(d) => d.flush(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +172,15 @@ mod tests {
         let mut out = decoder.feed(&bytes[..8]);
         out.extend(decoder.feed(&bytes[8..]));
         assert_eq!(out, vec![(None, "héllo".into())]);
+    }
+
+    #[test]
+    fn ndjson_lines_split_across_chunks() {
+        let mut decoder = NdjsonDecoder::default();
+        let mut out = decoder.feed(b"{\"a\":1}\n{\"b\"");
+        out.extend(decoder.feed(b":2}\r\n\n"));
+        out.extend(decoder.feed(b"{\"c\":3}"));
+        out.extend(decoder.flush());
+        assert_eq!(out, vec![(None, r#"{"a":1}"#.into()), (None, r#"{"b":2}"#.into()), (None, r#"{"c":3}"#.into())]);
     }
 }

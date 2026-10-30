@@ -12,7 +12,7 @@ use crate::adapter::{HttpCall, Method, ProviderAdapter};
 use crate::error::{redact, ErrorCode, ProviderError, Result};
 use crate::layer::{CacheConfig, CacheLayer, CallInfo, KeyFingerprint, Layer};
 use crate::registry::Registry;
-use crate::sse::SseDecoder;
+use crate::sse::StreamDecoder;
 use crate::types::{ChatRequest, ChatResponse, ModelInfo, StreamEvent};
 
 pub const MAX_MODEL_PAGES: usize = 20;
@@ -211,12 +211,14 @@ impl ChatClient {
         let call = adapter.chat_call(&request, &key, base_url.as_deref(), true)?;
         let response = self.send(adapter.as_ref(), &call, &key).await?;
         let parser = adapter.stream_parser(&request);
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
+        let decoder = StreamDecoder::for_format(adapter.stream_format(), content_type);
         let layers = self.inner.layers.clone();
         let provider_id = adapter.id().to_owned();
 
         Ok(Box::pin(async_stream::stream! {
             let mut parser = parser;
-            let mut decoder = SseDecoder::new();
+            let mut decoder = decoder;
             let mut body = response.bytes_stream();
             let mut text = String::new();
             let mut failed = false;
@@ -254,6 +256,14 @@ impl ChatClient {
                 }
             }
             if !failed {
+                for event in parser.flush_events() {
+                    if let StreamEvent::Delta { text: delta } = &event {
+                        if !layers.is_empty() {
+                            text.push_str(delta);
+                        }
+                    }
+                    yield Ok(event);
+                }
                 let done = parser.finish();
                 if !layers.is_empty() {
                     if let StreamEvent::Done { finish_reason, model, usage } = &done {
@@ -341,6 +351,9 @@ fn replay(hit: ChatResponse) -> ChatStream {
 
 fn require_key<'a>(adapter: &dyn ProviderAdapter, api_key: &'a str) -> Result<&'a str> {
     let key = api_key.trim();
+    if key.is_empty() && !adapter.requires_key() {
+        return Ok("");
+    }
     if key.is_empty() {
         return Err(ProviderError::new(ErrorCode::Auth, "an API key is required").provider(adapter.id()));
     }

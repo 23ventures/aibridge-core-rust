@@ -24,18 +24,28 @@ Compared with aibridge-exec on one CPU core ([full results and method](docs/benc
 | Server: peak memory | 66 MB | 11 MB | 6× less |
 | Python library: async chat, 50 concurrent, ops/s | 342 | 5,608 | 16× |
 
-## Scope of v0.1
+## Scope of v0.2 (matches aibridge-exec 0.4.0)
 
 | aibridge-exec module | In aibridge-core? |
 | --- | --- |
-| `providers` (chat, streaming, model lists; 10 providers) | Yes: Rust, plus Python bindings |
+| `providers` (chat, streaming, model lists; 20 providers; structured output, prompt caching, reasoning effort, thinking) | Yes: Rust, plus Python bindings |
 | HTTP server | Yes: wire-compatible |
 | `media` (image and video generation) | Not yet: keep using aibridge-exec |
 | `contracts` (tool and agent types) | No: plain Python types, nothing to speed up |
 | `code_runtime` | No: subprocess orchestration, nothing to speed up |
 
-Providers: `openai`, `anthropic`, `gemini`, `xai`, `openrouter`, `groq`, `deepseek`, `mistral`,
-`together`, and `openai_compatible` (any OpenAI-compatible URL).
+Providers, in aibridge-exec's order: `openai`, `xai`, `openrouter`, `groq`, `deepseek`, `mistral`,
+`together`, `kimi`, `nvidia`, `zai`, `minimax`, `arcee`, `ai21` (OpenAI protocol with per-provider
+rules), `anthropic`, `gemini`, `cohere` (v2 chat), `alibaba` (native DashScope), `meta` (Responses
+protocol), `ollama` (native, keyless, NDJSON streams) and `openai_compatible` (any OpenAI-compatible
+URL). `ollama` and `openai_compatible` have no public endpoint, so the server only exposes them with a
+configured base URL or `AIBRIDGE_EXEC_ALLOW_CUSTOM_BASE_URL`.
+
+Provider-neutral options, same as aibridge-exec 0.4.0: `response_format` (JSON reply, optionally
+schema-shaped, through each provider's native mechanism), `ChatMessage(cache=True)` (Anthropic
+prompt-cache breakpoints), `reasoning_effort` (`"lowest"` picks the cheapest setting a model
+accepts) and `thinking`. `Usage` reports `cache_read_tokens` / `cache_write_tokens` when the
+provider does.
 
 ## Run the server
 
@@ -95,6 +105,11 @@ with ChatClient(cache=CacheOptions(models_ttl=300)) as client:      # cache is o
     for event in client.stream("openai", api_key=KEY, model="<model id>",
                                messages=[{"role": "user", "content": "Count to five"}]):
         print(event.text if event.type == "delta" else event.usage)
+    data = client.chat("gemini", api_key=KEY, model="<model id>", reasoning_effort="lowest",
+                       response_format={"schema": {"type": "object", "properties": {"city": {"type": "string"}}}},
+                       messages=[{"role": "system", "content": LONG_STABLE_RULES, "cache": True},
+                                 {"role": "user", "content": "Where is the Golden Gate?"}])
+    print(data.text)   # JSON text
 ```
 
 Network waits release the GIL. The differences from aibridge-exec (no `http=` argument, no Python

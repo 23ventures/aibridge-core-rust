@@ -32,13 +32,14 @@ pub mod registry;
 pub mod sse;
 pub mod types;
 
-pub use adapter::{HttpCall, Method, ProviderAdapter, StreamParser};
+pub use adapter::{HttpCall, Method, ProviderAdapter, StreamFormat, StreamParser};
 pub use client::{ChatClient, ChatClientBuilder, ChatStream, Timeouts};
 pub use error::{ErrorCode, ProviderError, Result};
 pub use layer::{CacheConfig, CacheLayer, CacheStats, CallInfo, ChatCachePolicy, KeyFingerprint, Layer};
 pub use registry::Registry;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, FinishReason, ModelInfo, ProviderInfo, Role, StreamEvent, Usage,
+    ChatMessage, ChatRequest, ChatResponse, FinishReason, ModelInfo, ProviderInfo, ResponseFormat, Role, StreamEvent,
+    Usage, REASONING_EFFORTS,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

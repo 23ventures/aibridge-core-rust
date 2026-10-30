@@ -52,16 +52,45 @@ impl HttpCall {
     }
 }
 
+/// How a provider frames streamed replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFormat {
+    /// Server-Sent Events.
+    Sse,
+    /// Newline-delimited JSON (Ollama's native API).
+    Ndjson,
+    /// NDJSON unless the response says `text/event-stream`.
+    Auto,
+}
+
 /// Stateful parser for one streamed response.
 pub trait StreamParser: Send {
-    /// Handle one SSE event; return zero or more stream events.
+    /// Handle one event (an SSE event, or one NDJSON line with no event name).
     fn feed(&mut self, event: Option<&str>, data: &str) -> Result<Vec<StreamEvent>>;
+    /// Events still buffered when the stream ends (before `finish`).
+    fn flush_events(&mut self) -> Vec<StreamEvent> {
+        Vec::new()
+    }
     /// The final `done` event (usage, finish reason) once the stream ends.
     fn finish(&mut self) -> StreamEvent;
 }
 
 pub trait ProviderAdapter: Send + Sync {
     fn info(&self) -> &ProviderInfo;
+
+    /// `false` for servers that take no key (a local Ollama); a key is then sent only if given.
+    fn requires_key(&self) -> bool {
+        true
+    }
+
+    fn stream_format(&self) -> StreamFormat {
+        StreamFormat::Sse
+    }
+
+    /// Only usable with a caller- or server-supplied URL (no public default endpoint).
+    fn needs_custom_base_url(&self) -> bool {
+        false
+    }
 
     fn id(&self) -> &str {
         &self.info().id
@@ -186,6 +215,69 @@ pub fn py_str(value: &Value) -> String {
     }
 }
 
+/// `json.dumps(value)` with Python's defaults: `", "` / `": "` separators and non-ASCII escaped.
+/// Used where the reference adapters re-serialize provider JSON (tool inputs), so reply text
+/// matches byte for byte.
+pub fn py_json_dumps(value: &Value) -> String {
+    let mut out = String::new();
+    write_py_json(value, &mut out);
+    out
+}
+
+fn write_py_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(text) => write_py_string(text, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_py_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_py_string(key, out);
+                out.push_str(": ");
+                write_py_json(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_py_string(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || !c.is_ascii() => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 pub fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
 }
@@ -194,6 +286,15 @@ pub fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn python_json_dumps() {
+        let value = json!({"name": "Café ☕", "list": [1, 2.5, null, true], "nested": {"q": "a\"b\n"}, "e": {}});
+        assert_eq!(
+            py_json_dumps(&value),
+            r#"{"name": "Caf\u00e9 \u2615", "list": [1, 2.5, null, true], "nested": {"q": "a\"b\n"}, "e": {}}"#
+        );
+    }
 
     #[test]
     fn error_messages_from_common_shapes() {

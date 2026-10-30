@@ -8,7 +8,8 @@ use crate::adapter::{
 };
 use crate::error::Result;
 use crate::types::{
-    merge_consecutive, ChatRequest, ChatResponse, FinishReason, ModelInfo, ProviderInfo, Role, StreamEvent, Usage,
+    merge_consecutive, ChatMessage, ChatRequest, ChatResponse, FinishReason, ModelInfo, ProviderInfo, Role,
+    StreamEvent, Usage,
 };
 
 /// Python's `quote(s, safe="-._")`: unreserved characters stay, everything else is encoded.
@@ -52,7 +53,12 @@ impl ProviderAdapter for GeminiAdapter {
         stream: bool,
     ) -> Result<HttpCall> {
         let (system, turns) = request.split_system();
-        let contents: Vec<Value> = merge_consecutive(turns)
+        let mut turns = merge_consecutive(turns);
+        if turns.first().is_some_and(|t| t.role == Role::Assistant) {
+            // Gemini conversations must open with a user turn
+            turns.insert(0, ChatMessage::new(Role::User, "Continue."));
+        }
+        let contents: Vec<Value> = turns
             .iter()
             .map(|m| {
                 let role = if m.role == Role::Assistant { "model" } else { "user" };
@@ -70,6 +76,12 @@ impl ProviderAdapter for GeminiAdapter {
         }
         if let Some(max_tokens) = request.max_tokens {
             config.insert("maxOutputTokens".into(), json!(max_tokens));
+        }
+        if let Some(format) = &request.response_format {
+            config.insert("responseMimeType".into(), json!("application/json"));
+            if format.has_schema() {
+                config.insert("responseSchema".into(), to_gemini_schema(&format.json_schema()));
+            }
         }
         if !config.is_empty() {
             body.insert("generationConfig".into(), Value::Object(config));
@@ -211,10 +223,76 @@ fn usage(payload: &Value) -> Option<Usage> {
     Some(Usage::new(as_count(meta.get("promptTokenCount")), output))
 }
 
+/// JSON Schema to Gemini's `responseSchema` (an OpenAPI subset with upper-case types).
+///
+/// Keeps type, description, enum, required, nullable, properties and items; drops the rest.
+pub fn to_gemini_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else { return json!({"type": "STRING"}) };
+    let mut nullable = false;
+    let kind = match object.get("type") {
+        None => "object".to_owned(),
+        Some(Value::Array(kinds)) => {
+            nullable = kinds.iter().any(|k| k.as_str() == Some("null"));
+            kinds.iter().find(|k| k.as_str() != Some("null")).map(py_scalar_str).unwrap_or_else(|| "string".into())
+        }
+        Some(other) => py_scalar_str(other),
+    };
+    let kind = match kind.to_lowercase().as_str() {
+        "object" => "OBJECT",
+        "array" => "ARRAY",
+        "boolean" => "BOOLEAN",
+        "number" => "NUMBER",
+        "integer" => "INTEGER",
+        _ => "STRING",
+    };
+    let mut out = Map::new();
+    out.insert("type".into(), json!(kind));
+    if nullable || truthy(object.get("nullable")).is_some() {
+        out.insert("nullable".into(), json!(true));
+    }
+    if let Some(description) = object.get("description").filter(|d| d.is_string()) {
+        out.insert("description".into(), description.clone());
+    }
+    if let Some(Value::Array(values)) = object.get("enum") {
+        out.insert("enum".into(), Value::Array(values.iter().map(|v| json!(py_scalar_str(v))).collect()));
+    }
+    if kind == "OBJECT" {
+        let empty = Map::new();
+        let properties = truthy(object.get("properties")).and_then(Value::as_object).unwrap_or(&empty);
+        let converted: Map<String, Value> =
+            properties.iter().map(|(key, value)| (key.clone(), to_gemini_schema(value))).collect();
+        out.insert("properties".into(), Value::Object(converted));
+        let required: Vec<Value> = truthy(object.get("required"))
+            .and_then(Value::as_array)
+            .map(|keys| {
+                keys.iter().filter(|k| k.as_str().is_some_and(|k| properties.contains_key(k))).cloned().collect()
+            })
+            .unwrap_or_default();
+        if !required.is_empty() {
+            out.insert("required".into(), Value::Array(required));
+        }
+    } else if kind == "ARRAY" {
+        let default = json!({"type": "string"});
+        out.insert("items".into(), to_gemini_schema(truthy(object.get("items")).unwrap_or(&default)));
+    }
+    Value::Object(out)
+}
+
+/// Python's `str()` of a JSON scalar (`True`, `None`, `1.5`).
+fn py_scalar_str(value: &Value) -> String {
+    match value {
+        Value::Null => "None".into(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::ResponseFormat;
 
     fn request() -> ChatRequest {
         ChatRequest::new(
@@ -257,6 +335,31 @@ mod tests {
             .parse_chat(&json!({"promptFeedback": {"blockReason": "SAFETY"}}), &request())
             .unwrap();
         assert_eq!(blocked.finish_reason, Some(FinishReason::ContentFilter));
+    }
+
+    #[test]
+    fn leading_user_turn_and_structured_output() {
+        let schema = json!({"type": "object", "properties": {
+            "name": {"type": ["string", "null"], "description": "who"},
+            "tags": {"type": "array"}, "level": {"enum": [1, true, null, "x"], "type": "integer"}},
+            "required": ["name", "missing"], "additionalProperties": false});
+        let request = request().with_response_format(ResponseFormat::with_schema(schema));
+        let mut request = request;
+        request.messages.reverse();
+        let body = GeminiAdapter::default().chat_call(&request, "k", None, false).unwrap().json.unwrap();
+        assert_eq!(body["contents"][0], json!({"role": "user", "parts": [{"text": "Continue."}]}));
+        assert_eq!(
+            body["generationConfig"],
+            json!({"maxOutputTokens": 5, "responseMimeType": "application/json", "responseSchema": {
+                "type": "OBJECT", "properties": {
+                    "name": {"type": "STRING", "nullable": true, "description": "who"},
+                    "tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "level": {"type": "INTEGER", "enum": ["1", "True", "None", "x"]}},
+                "required": ["name"]}})
+        );
+        let plain = request.clone().with_response_format(ResponseFormat::default());
+        let body = GeminiAdapter::default().chat_call(&plain, "k", None, false).unwrap().json.unwrap();
+        assert!(body["generationConfig"].get("responseSchema").is_none());
     }
 
     #[test]

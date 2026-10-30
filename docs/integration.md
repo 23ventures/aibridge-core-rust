@@ -11,11 +11,20 @@ Not replaced (keep aibridge-exec installed for these): `aibridge_exec.contracts`
 `aibridge_exec.code_runtime` and `aibridge_exec.media`.
 
 How compatibility is checked:
-- **HTTP server:** `tests/parity/run_parity.py` sends 42 requests (success, error,
-  validation and streaming cases) to both servers. Status, content type and body must match byte
-  for byte.
+- **HTTP server:** `tests/parity/run_parity.py` sends 65 requests (success, error, validation and
+  streaming cases, and every newer provider in both modes) to both servers. Status, content type
+  and body must match byte for byte.
 - **Python library:** `tests/python/test_parity.py` runs 30 scenarios through both libraries,
   sync and async, and requires equal results and errors.
+- **Requests, per provider:** `tests/python/test_request_parity.py` sends every provider ×
+  13 models × 5 option sets (plain, schema + `reasoning_effort="lowest"` + `thinking=False`,
+  any-JSON + cache breakpoints + assistant-first turns, `reasoning_effort="none"`, custom tool name)
+  through both libraries, plus streams and model lists (1,898 cases with the other suites). The mock
+  answers with the exact request it received (path, query, auth and protocol headers, JSON body,
+  key order included) in each provider's protocol, as text, tool call or function call with cache
+  usage, so equal results mean byte-identical requests and identical parsing.
+- **aibridge-platform:** its test suite run on aibridge-core (see below) passes except three tests
+  that inject an `httpx.MockTransport`, which aibridge-core can't accept by design.
 - **Playground:** its own Playwright suite (`e2e/chat.spec.ts`) passes against aibridge-core with
   no playground changes.
 
@@ -60,10 +69,32 @@ To roll back, point the service at the exec image again: the API is identical.
 ## aibridge-platform
 
 The platform imports aibridge-exec for `contracts`, `code_runtime` and `media`. Those stay on
-aibridge-exec. Today its chat path still goes through the legacy `aibridgecore` package, not
-`aibridge_exec.providers`, so there's nothing to swap yet.
+aibridge-exec. Since platform #69 its text models (`aibridge/execution/text/`) call
+`aibridge_exec.providers` with the 0.4.0 options (structured output, cache breakpoints, reasoning
+effort, thinking), which aibridge-core implements identically.
 
-When chat moves to the exec provider layer, use aibridge-core for it. It is one import:
+To swap, every `aibridge_exec.providers` import in `aibridge/execution/text/` (client, components,
+legacy, model, errors, cache_usage) and `domain/services/validate_api_keys.py` moves to
+`aibridge_core.providers` (`HTTP_STATUS_FOR_CODE` is in `aibridge_core.errors`). Keep the classes from
+one library throughout: `ProviderError` from one isn't the other's. Safest is one module that
+re-exports them, chosen by a setting, so QA can flip between engines without a code change:
+
+```python
+# aibridge/execution/text/engine.py
+import os
+if os.getenv("AIBRIDGE_TEXT_ENGINE") == "core":
+    from aibridge_core.providers import *           # noqa: F403
+    from aibridge_core.errors import HTTP_STATUS_FOR_CODE
+else:
+    from aibridge_exec.providers import *           # noqa: F403
+    from aibridge_exec.providers.errors import HTTP_STATUS_FOR_CODE
+```
+
+To try it without code changes, put a `sitecustomize.py` on `PYTHONPATH` that maps
+`sys.modules["aibridge_exec.providers"]` (and `.errors`, `.types`) to the `aibridge_core` modules;
+that is how the platform suite above was run.
+
+The swap is one import per module:
 
 ```python
 # from aibridge_exec.providers import ChatClient, AsyncChatClient, ProviderError
@@ -75,7 +106,7 @@ Same method names, arguments, return types (`ChatResponse`, `StreamEvent`, `Mode
 `stream`. It also accepts aibridge-exec's `ChatMessage` objects, so modules can move one at a
 time.
 
-Two differences:
+Differences:
 - `ChatClient(http=httpx.Client(...))` isn't accepted, because the HTTP stack is Rust. Use
   `base_urls=` and `timeout=`. Tests that used `httpx.MockTransport` should point `base_urls`
   at a local mock server instead (see `tests/parity/mock_provider.py`).
@@ -94,7 +125,7 @@ source in the platform image:
 
 ```bash
 # CI builds wheels for Linux x86_64/arm64 and macOS arm64 on every v* tag (job "wheels")
-pip install aibridge_core-0.1.0-cp311-abi3-manylinux_2_28_x86_64.whl
+pip install aibridge_core-0.2.0-cp311-abi3-manylinux_2_28_x86_64.whl
 ```
 
 One `abi3` wheel covers Python 3.11 and newer. For local development, run

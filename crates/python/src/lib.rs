@@ -11,17 +11,34 @@ use std::time::Duration;
 
 use aibridge_core::{
     CacheConfig, CacheLayer, ChatCachePolicy, ChatClient, ChatMessage, ChatRequest, ChatResponse, ChatStream,
-    ModelInfo, ProviderError, Role, StreamEvent, Timeouts,
+    ModelInfo, ProviderError, ResponseFormat, Role, StreamEvent, Timeouts, Usage,
 };
 use futures_util::StreamExt;
 use pyo3::exceptions::{PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-/// (text, model, finish_reason, input_tokens, output_tokens)
-type ReplyTuple = (String, String, Option<&'static str>, Option<u64>, Option<u64>);
-/// ("delta", text, None, None, None) or ("done", finish_reason, model, input_tokens, output_tokens)
-type EventTuple = (&'static str, Option<String>, Option<String>, Option<u64>, Option<u64>);
+/// (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+type UsageTuple = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
+/// (text, model, finish_reason, usage)
+type ReplyTuple = (String, String, Option<&'static str>, UsageTuple);
+/// ("delta", text, None, None) or ("done", finish_reason, model, usage)
+type EventTuple = (&'static str, Option<String>, Option<String>, Option<UsageTuple>);
+/// (role, content, cache)
+type MessageTuple = (String, String, bool);
+/// (schema as JSON text or None, name, description)
+type FormatTuple = (Option<String>, String, String);
+/// (model, messages, system, temperature, max_tokens, response_format, reasoning_effort, thinking)
+type RequestTuple = (
+    String,
+    Vec<MessageTuple>,
+    Option<String>,
+    Option<f64>,
+    Option<u64>,
+    Option<FormatTuple>,
+    Option<String>,
+    Option<bool>,
+);
 /// (id, name, context_length)
 type ModelTuple = (String, Option<String>, Option<u64>);
 
@@ -45,20 +62,18 @@ fn to_pyerr(error: ProviderError) -> PyErr {
 }
 
 fn reply_tuple(reply: ChatResponse) -> ReplyTuple {
-    (
-        reply.text,
-        reply.model,
-        reply.finish_reason.map(|f| f.as_str()),
-        reply.usage.input_tokens,
-        reply.usage.output_tokens,
-    )
+    (reply.text, reply.model, reply.finish_reason.map(|f| f.as_str()), usage_tuple(reply.usage))
+}
+
+fn usage_tuple(usage: Usage) -> UsageTuple {
+    (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens)
 }
 
 fn event_tuple(event: StreamEvent) -> EventTuple {
     match event {
-        StreamEvent::Delta { text } => ("delta", Some(text), None, None, None),
+        StreamEvent::Delta { text } => ("delta", Some(text), None, None),
         StreamEvent::Done { finish_reason, model, usage } => {
-            ("done", finish_reason.map(|f| f.as_str().to_owned()), model, usage.input_tokens, usage.output_tokens)
+            ("done", finish_reason.map(|f| f.as_str().to_owned()), model, Some(usage_tuple(usage)))
         }
     }
 }
@@ -67,22 +82,32 @@ fn model_tuples(models: Vec<ModelInfo>) -> Vec<ModelTuple> {
     models.into_iter().map(|m| (m.id, m.name, m.context_length)).collect()
 }
 
-fn build_request(
-    model: String,
-    messages: Vec<(String, String)>,
-    system: Option<String>,
-    temperature: Option<f64>,
-    max_tokens: Option<u64>,
-) -> PyResult<ChatRequest> {
+fn build_request(raw: RequestTuple) -> PyResult<ChatRequest> {
+    let (model, messages, system, temperature, max_tokens, response_format, reasoning_effort, thinking) = raw;
     let messages = messages
         .into_iter()
-        .map(|(role, content)| {
-            Role::parse(&role)
-                .map(|role| ChatMessage { role, content })
-                .ok_or_else(|| PyValueError::new_err(format!("invalid role {role:?}")))
+        .map(|(role, content, cache)| {
+            let role = Role::parse(&role).ok_or_else(|| PyValueError::new_err(format!("invalid role {role:?}")))?;
+            Ok(ChatMessage { role, content, cache })
         })
         .collect::<PyResult<Vec<_>>>()?;
-    Ok(ChatRequest { model, messages, system, temperature, max_tokens })
+    let response_format = response_format
+        .map(|(schema, name, description)| -> PyResult<ResponseFormat> {
+            let schema = schema
+                .map(|text| serde_json::from_str(&text))
+                .transpose()
+                .map_err(|e| PyValueError::new_err(format!("response_format schema is not JSON: {e}")))?;
+            Ok(ResponseFormat { schema, name, description })
+        })
+        .transpose()?;
+    let mut request = ChatRequest::new(model, messages);
+    request.system = system;
+    request.temperature = temperature;
+    request.max_tokens = max_tokens;
+    request.response_format = response_format;
+    request.reasoning_effort = reasoning_effort;
+    request.thinking = thinking;
+    Ok(request)
 }
 
 #[derive(Clone)]
@@ -96,7 +121,7 @@ struct StreamArgs {
 
 enum StreamState {
     /// Not started: the request is sent on the first `next()`, like a Python generator.
-    Pending(StreamArgs),
+    Pending(Box<StreamArgs>),
     Running(ChatStream),
     /// An error that arrived after some events of a batch; raised on the next call.
     Failed(ProviderError),
@@ -282,43 +307,33 @@ impl NativeClient {
         Ok(Self { client, cache })
     }
 
-    #[pyo3(signature = (provider, api_key, model, messages, system=None, temperature=None, max_tokens=None, base_url=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (provider, api_key, request, base_url=None))]
     fn chat(
         &self,
         py: Python<'_>,
         provider: String,
         api_key: String,
-        model: String,
-        messages: Vec<(String, String)>,
-        system: Option<String>,
-        temperature: Option<f64>,
-        max_tokens: Option<u64>,
+        request: RequestTuple,
         base_url: Option<String>,
     ) -> PyResult<ReplyTuple> {
-        let request = build_request(model, messages, system, temperature, max_tokens)?;
+        let request = build_request(request)?;
         let client = self.client.clone();
         py.detach(|| runtime().block_on(client.chat(&provider, &api_key, request, base_url.as_deref())))
             .map(reply_tuple)
             .map_err(to_pyerr)
     }
 
-    #[pyo3(signature = (provider, api_key, model, messages, system=None, temperature=None, max_tokens=None, base_url=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (provider, api_key, request, base_url=None))]
     fn stream(
         &self,
         provider: String,
         api_key: String,
-        model: String,
-        messages: Vec<(String, String)>,
-        system: Option<String>,
-        temperature: Option<f64>,
-        max_tokens: Option<u64>,
+        request: RequestTuple,
         base_url: Option<String>,
     ) -> PyResult<NativeStream> {
-        let request = build_request(model, messages, system, temperature, max_tokens)?;
+        let request = build_request(request)?;
         let args = StreamArgs { client: self.client.clone(), provider, api_key, request, base_url };
-        Ok(NativeStream { state: Mutex::new(StreamState::Pending(args)) })
+        Ok(NativeStream { state: Mutex::new(StreamState::Pending(Box::new(args))) })
     }
 
     #[pyo3(signature = (provider, api_key, base_url=None))]
@@ -335,43 +350,33 @@ impl NativeClient {
             .map_err(to_pyerr)
     }
 
-    #[pyo3(signature = (provider, api_key, model, messages, system=None, temperature=None, max_tokens=None, base_url=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (provider, api_key, request, base_url=None))]
     fn achat<'py>(
         &self,
         py: Python<'py>,
         provider: String,
         api_key: String,
-        model: String,
-        messages: Vec<(String, String)>,
-        system: Option<String>,
-        temperature: Option<f64>,
-        max_tokens: Option<u64>,
+        request: RequestTuple,
         base_url: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request = build_request(model, messages, system, temperature, max_tokens)?;
+        let request = build_request(request)?;
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client.chat(&provider, &api_key, request, base_url.as_deref()).await.map(reply_tuple).map_err(to_pyerr)
         })
     }
 
-    #[pyo3(signature = (provider, api_key, model, messages, system=None, temperature=None, max_tokens=None, base_url=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (provider, api_key, request, base_url=None))]
     fn astream(
         &self,
         provider: String,
         api_key: String,
-        model: String,
-        messages: Vec<(String, String)>,
-        system: Option<String>,
-        temperature: Option<f64>,
-        max_tokens: Option<u64>,
+        request: RequestTuple,
         base_url: Option<String>,
     ) -> PyResult<NativeAsyncStream> {
-        let request = build_request(model, messages, system, temperature, max_tokens)?;
+        let request = build_request(request)?;
         let args = StreamArgs { client: self.client.clone(), provider, api_key, request, base_url };
-        Ok(NativeAsyncStream { state: Arc::new(tokio::sync::Mutex::new(StreamState::Pending(args))) })
+        Ok(NativeAsyncStream { state: Arc::new(tokio::sync::Mutex::new(StreamState::Pending(Box::new(args)))) })
     }
 
     #[pyo3(signature = (provider, api_key, base_url=None))]
@@ -406,9 +411,11 @@ impl NativeClient {
     }
 }
 
-/// Built-in providers as (id, label, key_url, default_base_url, key_hint), in registry order.
+/// Built-in providers as (id, label, key_url, default_base_url, key_hint, requires_key,
+/// needs_custom_base_url, stream_format), in registry order.
 #[pyfunction]
-fn providers() -> Vec<(String, String, String, String, String)> {
+#[allow(clippy::type_complexity)]
+fn providers() -> Vec<(String, String, String, String, String, bool, bool, &'static str)> {
     aibridge_core::Registry::builtin()
         .list()
         .iter()
@@ -420,6 +427,13 @@ fn providers() -> Vec<(String, String, String, String, String)> {
                 info.key_url.clone(),
                 info.default_base_url.clone(),
                 info.key_hint.clone(),
+                a.requires_key(),
+                a.needs_custom_base_url(),
+                match a.stream_format() {
+                    aibridge_core::StreamFormat::Sse => "sse",
+                    aibridge_core::StreamFormat::Ndjson => "ndjson",
+                    aibridge_core::StreamFormat::Auto => "auto",
+                },
             )
         })
         .collect()
