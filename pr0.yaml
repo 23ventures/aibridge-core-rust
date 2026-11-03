@@ -1,0 +1,8 @@
+# Proposed by Runqueue from the repository layout. Edit the doc roots before merging.
+project: axy
+docs:
+  - path: docs/**
+    role: developer
+    immutable: false
+meta: pr0/
+coverage: {}
